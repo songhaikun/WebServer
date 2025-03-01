@@ -162,6 +162,7 @@ bool HttpConn::readOnce() {
     }
     int bytes_read = 0;
     // ET模式，由于只通知一次，需要一次性将数据读完
+#ifdef LISTEN_ET
     while (true) {
         bytes_read = recv(sock_fd, read_buffer + read_idx, MAX_HEADER_LENGTH - read_idx, 0);
         if (bytes_read == -1) {
@@ -174,6 +175,14 @@ bool HttpConn::readOnce() {
         }
         read_idx += bytes_read;
     }
+#endif
+#ifdef LISTEN_LT
+    bytes_read = recv(sock_fd, read_buffer + read_idx, MAX_HEADER_LENGTH - read_idx, 0);
+    if (bytes_read <= 0) {
+        return false;
+    }
+    read_idx += bytes_read;
+#endif
     return true;
 }
 

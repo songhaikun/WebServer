@@ -111,7 +111,7 @@ int main() {
             if (sock_fd == fd) {
                 struct sockaddr_in client_addr;
                 socklen_t client_addr_len = sizeof(client_addr);
-
+#ifdef LISTEN_ET
                 while (true) {
                     int client_fd = accept(fd, (struct sockaddr*)&client_addr, &client_addr_len);
                     if (client_fd < 0) {
@@ -130,10 +130,24 @@ int main() {
                     std::cout << "client_fd: " << client_fd << std::endl;
                     users[client_fd].init(client_fd, addr);
                 }
-                
-
                 continue;
+#endif
+#ifdef LISTEN_LT
+                int client_fd = accept(fd, (struct sockaddr*) &client_addr, &client_addr_len);
+                if (client_fd < 0) {
+                    perror("accept error!");
+                    break;
+                }
+                if (HttpConn::user_count >= MAX_FD) {
+                    std::cout << "Internal server busy, link num out of bound" << std::endl;
+                    break;
+                }
+                std::cout << "--------------------------accept a new client-----------------" << std::endl;
+                std::cout << "client_fd: " << client_fd << std::endl;
+                users[client_fd].init(client_fd, addr);
+#endif
             }
+
             // 中断连接
             else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
                 // TODO change to time list

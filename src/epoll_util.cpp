@@ -8,7 +8,12 @@ EpollUtil* EpollUtil::getInstance() {
 void EpollUtil::addFd(int epollfd, int fd, bool one_shot) {
     epoll_event event;
     event.data.fd = fd;
+#ifdef LISTEN_ET
     event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+#endif
+#ifdef LISTEN_LT
+    event.events = EPOLLIN | EPOLLRDHUP;
+#endif
     if (one_shot) {
         event.events |= EPOLLONESHOT;
     }
@@ -24,7 +29,12 @@ void EpollUtil::removeFd(int epollfd, int fd) {
 void EpollUtil::modFd(int epollfd, int fd, int ev) {
     epoll_event event;
     event.data.fd = fd;
+#ifdef LISTEN_ET
     event.events = ev | EPOLLET | EPOLLONESHOT | EPOLLRDHUP;
+#endif
+#ifdef LISTEN_LT
+    event.events = ev | EPOLLONESHOT | EPOLLRDHUP;
+#endif
     epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
 }
 
