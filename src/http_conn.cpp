@@ -8,9 +8,12 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <ctime>
-
+#include <stdarg.h>
+#ifdef __APPLE__
 const char *html_root = "/Users/hksong/hksong/prjs/webServer/root";
-
+#elif __linux__
+const char *html_root = "/media/psf/Home/hksong/prjs/webServer/root";
+#endif
 // 辅助函数
 std::string getTime() {
     time_t t = time(0);
@@ -30,41 +33,11 @@ HttpConn::HttpConn(int client_fd) : client_fd(client_fd) {
     memset(read_buffer, 0, sizeof(read_buffer));
 }
 
-// void HttpConn::process() {
-
-//     time_t t = time(0);
-//     tm* local_time = localtime(&t);
-//     char time_str[128] = {0};
-//     strftime(time_str, 128, "%Y-%m-%d %H:%M:%S", local_time);
-//     std::cout << "----process start----" << std::endl << time_str << std::endl;
-
-//     if (-1 == client_fd) {
-//         return;
-//     }
-
-//     auto read_ret = processRead();
-//     if (read_ret == HTTP_CODE::NO_REQUEST) {
-//         return;
-//     }
-
-//     bool write_ret = processWrite(read_ret);
-//     if (!write_ret) {
-//         // TODO close connection
-//         return;
-//     }
-
-//     t = time(0);
-//     local_time = localtime(&t);
-//     memset(time_str, 0, sizeof(time_str));
-//     strftime(time_str, 128, "%Y-%m-%d %H:%M:%S", local_time);
-//     std::cout << "----process end----" << std::endl << time_str << std::endl;
-
-// }
-
 void HttpConn::process() {
     std::cout << getTime() << std::endl;
     while (true) {
         if (-1 == client_fd) {
+            std::cout << "client_fd is -1" << std::endl;
             break;
         }
         std::cout << "----process start---- fd: " << client_fd << " time: " << getTime() << std::endl;
@@ -74,11 +47,13 @@ void HttpConn::process() {
         }
         bool write_ret = processWrite(read_ret);
         if (!write_ret) {
+            std::cout << "write_ret is null" << std::endl;
             close(client_fd);
             client_fd = -1;
             break;
         }
         if (!linger) {
+            std::cout << "not keep-alive" << std::endl;
             close(client_fd);
             client_fd = -1;
             break;

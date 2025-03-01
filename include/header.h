@@ -1,5 +1,6 @@
 #pragma once
 #include <iostream>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/types.h>

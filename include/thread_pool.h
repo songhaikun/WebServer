@@ -5,6 +5,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <condition_variable>
 
 // typedef std::function<void(void)> Task;
 template <typename T>
@@ -18,9 +19,9 @@ private:
     // 任务队列
     std::list<T *> tasks;
     // 互斥锁
-    std::mutex m_mutex;
+    std::mutex pool_mutex;
     // 条件变量
-    std::condition_variable m_cond;
+    std::condition_variable cond;
     // 是否结束
     bool stop{false};
 
@@ -42,11 +43,10 @@ ThreadPool<T>::ThreadPool(int threadNum) : threadNum(threadNum) {
             T* task;
             while(!stop) {
                 {
-                    std::unique_lock<std::mutex> lock(this->m_mutex);
-                    this->m_cond.wait(lock, [this]() {
+                    std::unique_lock<std::mutex> lock(this->pool_mutex);
+                    this->cond.wait(lock, [this]() {
                         return !this->tasks.empty();
-                    }
-                    );
+                    });
                     task = this->tasks.front();
                     this->tasks.pop_front();
                 }
@@ -75,8 +75,8 @@ ThreadPool<T>::~ThreadPool() {
 template <typename T>
 void ThreadPool<T>::append(T* task) {
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> lock(pool_mutex);
         tasks.push_back(task);
     }
-    m_cond.notify_one();
+    cond.notify_one();
 }
