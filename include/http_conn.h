@@ -1,8 +1,9 @@
 #include <cstring>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
-#include <fcntl.h>
 #include <sys/mman.h>
 
 #define MAX_HEADER_LENGTH 8192
@@ -22,7 +23,12 @@ enum class HTTP_CODE {
 
 class HttpConn{
 private:
-    int client_fd;
+    int client_fd{-1};
+    int sock_fd{-1};
+    sockaddr_in address;
+
+    // 静态变量，用于存储全局信息
+
     char read_buffer[MAX_HEADER_LENGTH];
     char write_buffer[WRITE_BUFFER_SIZE];
 
@@ -31,6 +37,7 @@ private:
     int start_line{0};
     int content_length{0};
     int write_idx{0};
+
 
     bool linger{false};
     char* url;
@@ -87,7 +94,6 @@ private:
     HTTP_CODE doRequest();
 
     bool processWrite(HTTP_CODE read_ret);
-    bool write();
 
     bool addResponse(const char* format, ...);
     bool addStatusLine(int status, const char* title);
@@ -100,7 +106,21 @@ private:
     void unmap();
 
 public:
+    static int epoll_fd;
+    static int user_count;
+public:
     HttpConn();
     explicit HttpConn(int client_fd);
     void process();
+
+    // 提供外部epoll调用
+    void init(int sockfd, const sockaddr_in &addr);
+    void closeConn(bool real_close = true);
+    bool readOnce();
+    bool write();
+
+    sockaddr_in *get_address()
+    {
+        return &address;
+    }
 };

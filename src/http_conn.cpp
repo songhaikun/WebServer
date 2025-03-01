@@ -1,3 +1,4 @@
+#include "epoll_util.h"
 #include "http_conn.h"
 
 #include <iostream>
@@ -9,11 +10,17 @@
 #include <unistd.h>
 #include <ctime>
 #include <stdarg.h>
+#include <sys/epoll.h>
+
 #ifdef __APPLE__
 const char *html_root = "/Users/hksong/hksong/prjs/webServer/root";
 #elif __linux__
 const char *html_root = "/media/psf/Home/hksong/prjs/webServer/root";
 #endif
+
+int HttpConn::epoll_fd = -1;
+int HttpConn::user_count = 0;
+
 // 辅助函数
 std::string getTime() {
     time_t t = time(0);
@@ -24,7 +31,6 @@ std::string getTime() {
 }
 
 HttpConn::HttpConn() {
-    client_fd = -1;
     init();
     // memset(read_buffer, 0, sizeof(read_buffer));
 }
@@ -34,52 +40,21 @@ HttpConn::HttpConn(int client_fd) : client_fd(client_fd) {
 }
 
 void HttpConn::process() {
-    std::cout << getTime() << std::endl;
-    while (true) {
-        if (-1 == client_fd) {
-            std::cout << "client_fd is -1" << std::endl;
-            break;
-        }
-        std::cout << "----process start---- fd: " << client_fd << " time: " << getTime() << std::endl;
-        auto read_ret = processRead();
-        if (read_ret == HTTP_CODE::NO_REQUEST) {
-            continue;
-        }
-        bool write_ret = processWrite(read_ret);
-        if (!write_ret) {
-            std::cout << "write_ret is null" << std::endl;
-            close(client_fd);
-            client_fd = -1;
-            break;
-        }
-        if (!linger) {
-            std::cout << "not keep-alive" << std::endl;
-            close(client_fd);
-            client_fd = -1;
-            break;
-        }
-        // 如果是keep-alive，保留client_id与linger状态，准备下一次读取
-        read_idx = 0;
-        checked_idx = 0;
-        start_line = 0;
-        state = PARSE_STATUS::REQUEST_LINE;
-        method = HTTP_METHOD::GET;
-        url = 0;
-        version = 0;
-        content_length = 0;
-        cgi = 0;
-        bytes_to_send = 0;
-        bytes_have_send = 0;
-        memset(read_buffer, 0, sizeof(read_buffer));
-        memset(write_buffer, 0, sizeof(write_buffer));
-        memset(real_file, 0, sizeof(real_file));
-        memset(&file_stat, 0, sizeof(file_stat));
-        iv_count = 0;
-        write_idx = 0;
-        // std::cout << "----ready for next---- fd: " << client_fd << std::endl;
+    HTTP_CODE read_ret = processRead();
+    if (read_ret == HTTP_CODE::NO_REQUEST)
+    {
+        // 等待读事件
+        EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
+        return;
     }
-    std::cout << getTime() << std::endl;
-    std::cout << "----process end---- fd: " << client_fd << std::endl;
+    bool write_ret = processWrite(read_ret);
+    if (!write_ret)
+    {
+        std::cout << "write error, processWrite return false" << std::endl;
+        closeConn();
+    }
+    // 通知写事件
+    EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLOUT);
 }
 
 
@@ -87,21 +62,6 @@ HTTP_CODE HttpConn::processRead() {
     LINE_STATUS line_status = LINE_STATUS::LINE_OK;
     HTTP_CODE ret = HTTP_CODE::NO_REQUEST;
 
-    // 没有epoll下，直接阻塞读取
-    int res = recv(client_fd, read_buffer, sizeof(read_buffer), 0);
-    if (res < 0) {
-        perror("recv error!");
-        close(client_fd);
-        return HTTP_CODE::BAD_REQUEST;
-    } else if (res == 0) {
-        perror("client close!");
-        close(client_fd);
-        return HTTP_CODE::CLOSED_CONNECTION;
-    }
-    read_idx = res;
-
-    // 打印buffer
-    std::cout << "----recv----" << std::endl << read_buffer << std::endl;
     char *text = read_buffer;
     // 解析请求行
     while ((state == PARSE_STATUS::REQUEST_BODY && line_status == LINE_STATUS::LINE_OK) ||
@@ -174,21 +134,9 @@ bool HttpConn::processWrite(HTTP_CODE read_ret) {
                 iv[1].iov_len = file_stat.st_size;
                 iv_count = 2;
                 bytes_to_send = write_idx + file_stat.st_size;
-                // TODO change to epoll ctl
-                this->write();
 
-                t = time(0);
-                local_time = localtime(&t);
-                memset(time_str, 0, sizeof(time_str));
-                strftime(time_str, 128, "%Y-%m-%d %H:%M:%S", local_time);
-                std::cout << "----time----" << std::endl << time_str << std::endl;
-                std::cout << "----write end----" << std::endl;
                 return true;
             } else {
-                // const char *ok_string = "<html><body></body></html>";
-                // addHeaders(strlen(ok_string));
-                // if (!addContent(ok_string))
-                //     return false;
             }
             break;
         }
@@ -200,9 +148,47 @@ bool HttpConn::processWrite(HTTP_CODE read_ret) {
     return true;
 }
 
+void HttpConn::closeConn(bool real_close) {
+    if (real_close && sock_fd != -1) {
+        EpollUtil::getInstance()->removeFd(epoll_fd, sock_fd);
+        sock_fd = -1;
+        user_count--;
+    }
+}
+
+bool HttpConn::readOnce() {
+    if (read_idx >= MAX_HEADER_LENGTH) {
+        return false;
+    }
+    int bytes_read = 0;
+    // ET模式，由于只通知一次，需要一次性将数据读完
+    while (true) {
+        bytes_read = recv(sock_fd, read_buffer + read_idx, MAX_HEADER_LENGTH - read_idx, 0);
+        if (bytes_read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            return false;
+        } else if (bytes_read == 0) {
+            return false;
+        }
+        read_idx += bytes_read;
+    }
+    return true;
+}
+
+void HttpConn::init(int sockfd, const sockaddr_in &addr) {
+    sock_fd = sockfd;
+    address = addr;
+    EpollUtil::getInstance()->addFd(epoll_fd, sock_fd, true);
+    user_count++;
+    init();
+}
+
 void HttpConn::init() {
-    client_fd = -1;
+    // client_fd = -1;
     read_idx = 0;
+    write_idx = 0;
     checked_idx = 0;
     start_line = 0;
     state = PARSE_STATUS::REQUEST_LINE;
@@ -214,13 +200,13 @@ void HttpConn::init() {
     cgi = 0;
     bytes_to_send = 0;
     bytes_have_send = 0;
+    host = 0;
+
     memset(read_buffer, 0, sizeof(read_buffer));
     memset(write_buffer, 0, sizeof(write_buffer));
     memset(real_file, 0, sizeof(real_file));
-    // memset(file_address, 0, sizeof(file_address));
+    memset(&address, 0, sizeof(address));
     memset(&file_stat, 0, sizeof(file_stat));
-    iv_count = 0;
-    write_idx = 0;
 }
 
 
@@ -228,14 +214,20 @@ void HttpConn::init() {
 bool HttpConn::write() {
     int temp = 0;
     if (bytes_to_send == 0) {
+        // 传输完毕，修改为监听读事件
+        std::cout << "transmission complete" << std::endl;
+        EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
         init();
         return true;
     }
     while (1) {
-        temp = writev(client_fd, iv, iv_count);
+        temp = writev(sock_fd, iv, iv_count);
+        std::cout << "sock_fd: " << sock_fd << std::endl;
         if (temp < 0) {
+            // TCP 写缓存满，监听下一个写事件
             if (errno == EAGAIN) {
-                std::cout << "EAGAIN: write buffer full, retry later" << std::endl;
+                std::cout << "TCP write buffer is full, waiting for next EPOLLOUT event" << std::endl;
+                EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLOUT);
                 return true;
             }
             unmap();
@@ -254,7 +246,13 @@ bool HttpConn::write() {
         }
         if (bytes_to_send <= 0) {
             unmap();
-            return true; // 不关闭连接，支持复用
+            EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
+            if (linger) {
+                init();
+                return true;
+            } else {
+                return false;
+            }
         }
     }
 }
@@ -288,7 +286,6 @@ bool HttpConn::addStatusLine(int status, const char* title) {
 
 bool HttpConn::addHeaders(int content_len) {
     addContentLength(content_len);
-    // addContentType();
     addLinger();
     addBlankLine();
     return true;
@@ -506,45 +503,3 @@ HTTP_CODE HttpConn::doRequest() {
     return HTTP_CODE::FILE_REQUEST;
 
 }
-
-// bool HttpConn::write() {
-//     // 输出需要发送的数据量bytes_to_send
-//     std::cout << "----write----" << std::endl << "bytes_to_send: " << bytes_to_send << std::endl;
-//     int temp = 0;
-//     if (bytes_to_send == 0) {
-//         // modfd(m_epollfd, m_sockfd, EPOLLIN);
-//         init();
-//         return true;
-//     }
-//     while (1) {
-//         temp = writev(client_fd, iv, iv_count);
-//         if (temp < 0) {
-//             if (errno == EAGAIN) {
-//                 // modfd(m_epollfd, m_sockfd, EPOLLOUT);
-//                 return true;
-//             }
-//             unmap();
-//             return false;
-//         }
-//         bytes_have_send += temp;
-//         bytes_to_send -= temp;
-//         if (bytes_have_send >= iv[0].iov_len) {
-//             iv[0].iov_len = 0;
-//             iv[1].iov_base = file_address + (bytes_have_send - write_idx);
-//             iv[1].iov_len = bytes_to_send;
-//         } else {
-//             iv[0].iov_base = write_buffer + bytes_have_send;
-//             iv[0].iov_len = iv[0].iov_len - bytes_have_send;
-//         }
-//         if (bytes_to_send <= 0) {
-//             unmap();
-//             // modfd(m_epollfd, m_sockfd, EPOLLIN);
-//             if (linger) {
-//                 init();
-//                 return true;
-//             } else {
-//                 return false;
-//             }
-//         }
-//     }
-// }
