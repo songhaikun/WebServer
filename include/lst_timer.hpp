@@ -3,6 +3,7 @@
 
 #include "timer_base.h"
 #include <unordered_map>
+#include <mutex>  // 添加 mutex 头文件
 
 struct timer_node {
     int fd;                            // 文件描述符
@@ -16,6 +17,7 @@ class sort_timer_lst : public TimerBase {
 public:
     sort_timer_lst(time_t unit = 5) : head(nullptr), tail(nullptr), timeout_unit(unit) {}
     ~sort_timer_lst() {
+        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁保护析构
         timer_node* tmp = head;
         while (tmp) {
             head = tmp->next;
@@ -25,6 +27,7 @@ public:
     }
 
     void add_timer(int fd, time_t timeout_sec, std::function<void(int)> callback) override {
+        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         timer_node* timer = new timer_node{fd, time(nullptr) + timeout_sec * timeout_unit, callback, nullptr, nullptr};
         nodes[fd] = timer; // 记录 fd 到 timer 的映射
         if (!head) {
@@ -39,6 +42,7 @@ public:
     }
 
     void adjust_timer(int fd, time_t timeout_sec) override {
+        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         auto it = nodes.find(fd);
         if (it == nodes.end()) return;
         timer_node* timer = it->second;
@@ -57,6 +61,7 @@ public:
     }
 
     void del_timer(int fd) override {
+        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         auto it = nodes.find(fd);
         if (it == nodes.end()) return;
         timer_node* timer = it->second;
@@ -81,12 +86,10 @@ public:
     }
 
     void tick() override {
+        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         if (!head) return;
-        // LOG_INFO("%s", "timer tick");
-        // Log::get_instance()->flush();
         time_t cur = time(nullptr);
         while (head && head->expire <= cur) {
-            // std::cout << "link expired" << std::endl;
             timer_node* tmp = head;
             tmp->callback(tmp->fd);
             nodes.erase(tmp->fd);
@@ -97,6 +100,7 @@ public:
     }
 
     void set_timeout_unit(time_t unit) override {
+        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         timeout_unit = unit;
     }
 
@@ -128,6 +132,7 @@ private:
     timer_node* tail;
     std::unordered_map<int, timer_node*> nodes; // fd 到 timer 的映射
     time_t timeout_unit;                        // 超时单位
+    // std::mutex mutex_;                          // 互斥锁，用于线程安全
 };
 
 #endif

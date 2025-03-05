@@ -24,6 +24,12 @@ static int pipefd[2];
 static sort_timer_lst timer_lst;
 static int epoll_fd = 0;
 
+struct EventContext {
+    int sock_fd;
+    HttpConn* conn;  // 直接引用 users[sock_fd]，避免拷贝
+    ThreadPool* pool;
+};
+
 // 定时器回调函数，每5s触发一次
 void timer_handler()
 {
@@ -75,7 +81,7 @@ int main() {
     Log::get_instance()->init("ServerLog", 2000, 800000, 0); //同步日志模型
 #endif    
     addsig(SIGPIPE, SIG_IGN);
-    ThreadPool<HttpConn> pool(HTTP_THREAD_NUM);
+    ThreadPool pool(HTTP_THREAD_NUM);
 
     // 创建列表
     HttpConn* users = new HttpConn[MAX_FD];
@@ -233,7 +239,15 @@ int main() {
 
                 LOG_INFO("sock_fd && epoll in: %d", sock_fd);
                 if (users[sock_fd].readOnce()) {
-                    pool.append(users + sock_fd); // append需要是非阻塞接口
+                    auto context = std::make_shared<EventContext>();
+                    context->sock_fd = sock_fd;
+                    context->conn = &users[sock_fd];  // 直接传递引用，避免拷贝
+                    context->pool = &pool;
+                    pool.append([](std::shared_ptr<void> args) {
+                        auto ctx = std::static_pointer_cast<EventContext> (args);
+                        ctx->conn->process();
+                    }, context);
+                    // pool.append(users + sock_fd); // append需要是非阻塞接口
                     timer_lst.adjust_timer(sock_fd, 3);
                 } else {
                     timer_lst.del_timer(sock_fd);
