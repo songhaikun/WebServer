@@ -105,6 +105,8 @@ private:
     void init();
     void unmap();
 
+    char *getLine() { return read_buffer + start_line; };
+
 public:
     static int epoll_fd;
     static int user_count;

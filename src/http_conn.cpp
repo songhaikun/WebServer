@@ -1,5 +1,6 @@
 #include "epoll_util.h"
 #include "http_conn.h"
+#include "log.h"
 
 #include <iostream>
 #include <sys/socket.h>
@@ -11,24 +12,26 @@
 #include <ctime>
 #include <stdarg.h>
 #include <sys/epoll.h>
-
+#include <sstream>
 #ifdef __APPLE__
 const char *html_root = "/Users/hksong/hksong/prjs/webServer/root";
 #elif __linux__
 const char *html_root = "/media/psf/Home/hksong/prjs/webServer/root";
 #endif
 
+//定义http响应的一些状态信息
+const char *ok_200_title = "OK";
+const char *error_400_title = "Bad Request";
+const char *error_400_form = "Your request has bad syntax or is inherently impossible to staisfy.\n";
+const char *error_403_title = "Forbidden";
+const char *error_403_form = "You do not have permission to get file form this server.\n";
+const char *error_404_title = "Not Found";
+const char *error_404_form = "The requested file was not found on this server.\n";
+const char *error_500_title = "Internal Error";
+const char *error_500_form = "There was an unusual problem serving the request file.\n";
+
 int HttpConn::epoll_fd = -1;
 int HttpConn::user_count = 0;
-
-// 辅助函数
-std::string getTime() {
-    time_t t = time(0);
-    tm* local_time = localtime(&t);
-    char time_str[128] = {0};
-    strftime(time_str, 128, "%Y-%m-%d %H:%M:%S", local_time);
-    return std::string(time_str);
-}
 
 HttpConn::HttpConn() {
     init();
@@ -40,21 +43,27 @@ HttpConn::HttpConn(int client_fd) : client_fd(client_fd) {
 }
 
 void HttpConn::process() {
+    std::ostringstream oss;
+    oss << std::this_thread::get_id();
+    std::string thread_id_str = oss.str();
+    LOG_INFO_T("HttpConn::process start, thread_id= %s", thread_id_str.c_str());
     HTTP_CODE read_ret = processRead();
     if (read_ret == HTTP_CODE::NO_REQUEST)
     {
         // 等待读事件
         EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
+        LOG_INFO_T("HttpConn::process read return NO_REQUEST, thread_id= %s", thread_id_str.c_str());
         return;
     }
     bool write_ret = processWrite(read_ret);
     if (!write_ret)
     {
-        std::cout << "write error, processWrite return false" << std::endl;
+        LOG_INFO_T("HttpConn::process write return false, thread_id= %s", thread_id_str.c_str());
         closeConn();
     }
     // 通知写事件
     EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLOUT);
+    LOG_INFO_T("HttpConn::process normal end, thread_id= %s", thread_id_str.c_str());
 }
 
 
@@ -62,12 +71,12 @@ HTTP_CODE HttpConn::processRead() {
     LINE_STATUS line_status = LINE_STATUS::LINE_OK;
     HTTP_CODE ret = HTTP_CODE::NO_REQUEST;
 
-    char *text = read_buffer;
+    char *text = 0;
     // 解析请求行
     while ((state == PARSE_STATUS::REQUEST_BODY && line_status == LINE_STATUS::LINE_OK) ||
            (line_status = parseLine()) == LINE_STATUS::LINE_OK) {
 
-        text = read_buffer + start_line;
+        text = getLine();
         start_line = checked_idx;
         switch(state) {
             case PARSE_STATUS::REQUEST_LINE: {
@@ -105,29 +114,38 @@ HTTP_CODE HttpConn::processRead() {
 bool HttpConn::processWrite(HTTP_CODE read_ret) {
     switch (read_ret) {
         case HTTP_CODE::INTERNAL_ERROR: {
+            LOG_INFO("INTERNAL ERRORFI");
+            addStatusLine(500, error_500_title);
+            addHeaders(strlen(error_500_form));
+            if (!addResponse("%s", error_500_form)) {
+                return false;
+            }
             break;
         }
         case HTTP_CODE::BAD_REQUEST: {
+            LOG_INFO("BAD REQUEST");
+            addStatusLine(404, error_404_title);
+            addHeaders(strlen(error_404_form));
+            if (!addResponse("%s", error_404_form)) {
+                return false;
+            }
             break;
         }
         case HTTP_CODE::FORBIDDEN_REQUEST: {
+            LOG_INFO("FORBIDDEN REQUEST");
+            addStatusLine(403, error_403_title);
+            addHeaders(strlen(error_403_form));
+            if (!addResponse("%s", error_403_form)) {
+                return false;
+            }
             break;
         }
         case HTTP_CODE::FILE_REQUEST: {
+            LOG_INFO("FILE REQUEST");
             addStatusLine(200, "OK");
             addContentType();
             if (file_stat.st_size != 0) {
                 addHeaders(file_stat.st_size);
-                // print headers
-                // 输出当前时间
-                time_t t = time(0);
-                tm* local_time = localtime(&t);
-                char time_str[128] = {0};
-                strftime(time_str, 128, "%Y-%m-%d %H:%M:%S", local_time);
-                std::cout << "----time----" << std::endl << time_str << std::endl;
-                std::cout << "----headers----" << std::endl << write_buffer << std::endl;
-
-
                 iv[0].iov_base = write_buffer;
                 iv[0].iov_len = write_idx;
                 iv[1].iov_base = file_address;
@@ -137,14 +155,23 @@ bool HttpConn::processWrite(HTTP_CODE read_ret) {
 
                 return true;
             } else {
+                const char *ok_string = "<html><body></body></html>";
+                addHeaders(strlen(ok_string));
+                if (!addResponse("%s", ok_string)){
+                    return false;
+                }
+                return false;
             }
-            break;
         }
         default: {
             return false;
         }
         
     }
+    iv[0].iov_base = write_buffer;
+    iv[0].iov_len = write_idx;
+    iv_count = 1;
+    bytes_to_send = write_idx;
     return true;
 }
 
@@ -214,8 +241,8 @@ void HttpConn::init() {
     memset(read_buffer, 0, sizeof(read_buffer));
     memset(write_buffer, 0, sizeof(write_buffer));
     memset(real_file, 0, sizeof(real_file));
-    memset(&address, 0, sizeof(address));
-    memset(&file_stat, 0, sizeof(file_stat));
+    // memset(&address, 0, sizeof(address));
+    // memset(&file_stat, 0, sizeof(file_stat));
 }
 
 
@@ -224,25 +251,28 @@ bool HttpConn::write() {
     int temp = 0;
     if (bytes_to_send == 0) {
         // 传输完毕，修改为监听读事件
-        std::cout << "transmission complete" << std::endl;
+        // std::cout << "transmission complete" << std::endl;
         EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
         init();
         return true;
     }
     while (1) {
         temp = writev(sock_fd, iv, iv_count);
-        std::cout << "sock_fd: " << sock_fd << std::endl;
+        LOG_INFO("send sth to client");
+        // std::cout << "sock_fd: " << sock_fd << std::endl;
         if (temp < 0) {
             // TCP 写缓存满，监听下一个写事件
             if (errno == EAGAIN) {
-                std::cout << "TCP write buffer is full, waiting for next EPOLLOUT event" << std::endl;
+                // std::cout << "TCP write buffer is full, waiting for next EPOLLOUT event" << std::endl;
                 EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLOUT);
+
+                LOG_INFO_T("write buf is full.");
                 return true;
             }
             unmap();
             return false;
         }
-        std::cout << "Sent " << temp << " bytes for " << real_file << ", remaining " << bytes_to_send - temp << std::endl;
+        // std::cout << "Sent " << temp << " bytes for " << real_file << ", remaining " << bytes_to_send - temp << std::endl;
         bytes_have_send += temp;
         bytes_to_send -= temp;
         if (bytes_have_send >= iv[0].iov_len) {
@@ -258,8 +288,10 @@ bool HttpConn::write() {
             EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
             if (linger) {
                 init();
+                LOG_INFO("keep-alive is true");
                 return true;
             } else {
+                LOG_INFO("keep-alive is false, return false");
                 return false;
             }
         }
@@ -356,6 +388,7 @@ HttpConn::LINE_STATUS HttpConn::parseLine() {
 HTTP_CODE HttpConn::parseRequestLine(char* text) {
     url = strpbrk(text, " \t");
     if (!url) {
+        LOG_INFO("BAD: !URL");
         return HTTP_CODE::BAD_REQUEST;
     }
     *url++ = '\0';
@@ -366,16 +399,19 @@ HTTP_CODE HttpConn::parseRequestLine(char* text) {
         method = HTTP_METHOD::POST;
         cgi = 1;
     } else {
+        LOG_INFO("BAD: !GET || !POST");
         return HTTP_CODE::BAD_REQUEST;
     }
     url += strspn(url, " \t");
     version = strpbrk(url, " \t");
     if (!version) {
+        LOG_INFO("BAD: !VERSION");
         return HTTP_CODE::BAD_REQUEST;
     }
     *version++ = '\0';
     version += strspn(version, " \t");
     if (strcasecmp(version, "HTTP/1.1") != 0) {
+        LOG_INFO("BAD: !HTTP1.1");
         return HTTP_CODE::BAD_REQUEST;
     }
     // 处理 HTTP URL 前缀：
@@ -390,6 +426,7 @@ HTTP_CODE HttpConn::parseRequestLine(char* text) {
     }
     // 验证 URL 格式的合法性：
     if (!url || url[0] != '/') {
+        LOG_INFO("BAD: URL[0] NOT /");
         return HTTP_CODE::BAD_REQUEST;
     }
 
@@ -437,8 +474,9 @@ HTTP_CODE HttpConn::parseRequestHeader(char* text) {
         host = text;
     }
     else
-    {
-        printf("oop!unknow header: %s\n",text);
+    {   
+        // std::cout << "oop!unknow header: " << text << std::endl;
+        // printf("oop!unknow header: %s\n",text);
         // LOG_INFO("oop!unknow header: %s", text);
         // Log::get_instance()->flush();
 
@@ -461,7 +499,8 @@ HTTP_CODE HttpConn::parseRequestBody(char* text) {
 HTTP_CODE HttpConn::doRequest() {
     strcpy(real_file, html_root);
     int len = strlen(html_root);
-    printf("url:%s\n", url);
+    // printf("url:%s\n", url);
+    // std::cout << "url: " << url << std::endl;
     const char* p = strrchr(url, '/');
     if (cgi == 1){
         // TODO 处理数据库等信息
@@ -504,11 +543,11 @@ HTTP_CODE HttpConn::doRequest() {
         return HTTP_CODE::FORBIDDEN_REQUEST; // 不是本用户，没有权限
     }
     if (S_ISDIR(file_stat.st_mode)) {
+        LOG_INFO("BAD: GET DIR");
         return HTTP_CODE::BAD_REQUEST; // 请求的是目录
     }
     int file_fd = open(real_file, O_RDONLY);
     file_address = (char*)mmap(0, file_stat.st_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
     close(file_fd);
     return HTTP_CODE::FILE_REQUEST;
-
-}
+}  
