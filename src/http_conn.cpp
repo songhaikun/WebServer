@@ -1,4 +1,5 @@
 #include "epoll_util.h"
+#include "fd_manager.hpp"
 #include "http_conn.h"
 #include "log.h"
 
@@ -43,27 +44,20 @@ HttpConn::HttpConn(int client_fd) : client_fd(client_fd) {
 }
 
 void HttpConn::process() {
-    std::ostringstream oss;
-    oss << std::this_thread::get_id();
-    std::string thread_id_str = oss.str();
-    LOG_INFO_T("HttpConn::process start, thread_id= %s", thread_id_str.c_str());
     HTTP_CODE read_ret = processRead();
     if (read_ret == HTTP_CODE::NO_REQUEST)
     {
-        // 等待读事件
-        EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
-        LOG_INFO_T("HttpConn::process read return NO_REQUEST, thread_id= %s", thread_id_str.c_str());
+        LOG_INFO("HttpConn::process read return NO_REQUEST");
         return;
     }
     bool write_ret = processWrite(read_ret);
     if (!write_ret)
     {
-        LOG_INFO_T("HttpConn::process write return false, thread_id= %s", thread_id_str.c_str());
-        closeConn();
+        LOG_INFO("HttpConn::process write return false");
+        // closeConn();
+        return;
     }
-    // 通知写事件
-    EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLOUT);
-    LOG_INFO_T("HttpConn::process normal end, thread_id= %s", thread_id_str.c_str());
+    LOG_INFO("HttpConn::process normal end");
 }
 
 
@@ -143,6 +137,7 @@ bool HttpConn::processWrite(HTTP_CODE read_ret) {
         case HTTP_CODE::FILE_REQUEST: {
             LOG_INFO("FILE REQUEST");
             addStatusLine(200, "OK");
+            LOG_INFO("real_file: %s", real_file);
             addContentType();
             if (file_stat.st_size != 0) {
                 addHeaders(file_stat.st_size);
@@ -175,41 +170,29 @@ bool HttpConn::processWrite(HTTP_CODE read_ret) {
     return true;
 }
 
-void HttpConn::closeConn(bool real_close) {
-    if (real_close && sock_fd != -1) {
-        EpollUtil::getInstance()->removeFd(epoll_fd, sock_fd);
-        sock_fd = -1;
-        user_count--;
-    }
-}
-
-bool HttpConn::readOnce() {
+bool HttpConn::read() {
     if (read_idx >= MAX_HEADER_LENGTH) {
         return false;
     }
     int bytes_read = 0;
-    // ET模式，由于只通知一次，需要一次性将数据读完
-#ifdef LISTEN_ET
     while (true) {
         bytes_read = recv(sock_fd, read_buffer + read_idx, MAX_HEADER_LENGTH - read_idx, 0);
         if (bytes_read == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
+                return true; // 数据读完，等待下次 EPOLLIN
             }
-            return false;
-        } else if (bytes_read == 0) {
-            return false;
+            LOG_ERROR("recv failed for fd: %d, errno: %d", sock_fd, errno);
+            return false; // 其他错误，关闭连接
+        }
+        if (bytes_read == 0) {
+            LOG_INFO("client closed connection for fd: %d", sock_fd);
+            return false; // 客户端关闭连接
         }
         read_idx += bytes_read;
+        if (read_idx >= MAX_HEADER_LENGTH) {
+            return false; // 缓冲区满
+        }
     }
-#endif
-#ifdef LISTEN_LT
-    bytes_read = recv(sock_fd, read_buffer + read_idx, MAX_HEADER_LENGTH - read_idx, 0);
-    if (bytes_read <= 0) {
-        return false;
-    }
-    read_idx += bytes_read;
-#endif
     return true;
 }
 
@@ -241,61 +224,50 @@ void HttpConn::init() {
     memset(read_buffer, 0, sizeof(read_buffer));
     memset(write_buffer, 0, sizeof(write_buffer));
     memset(real_file, 0, sizeof(real_file));
-    // memset(&address, 0, sizeof(address));
-    // memset(&file_stat, 0, sizeof(file_stat));
 }
 
-
-
-bool HttpConn::write() {
-    int temp = 0;
+HttpConn::WRITE_RES HttpConn::write() {
     if (bytes_to_send == 0) {
-        // 传输完毕，修改为监听读事件
-        // std::cout << "transmission complete" << std::endl;
-        EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
-        init();
-        return true;
+        LOG_INFO("call init in write end, fd: %d", sock_fd);
+        return WRITE_RES::WRITE_END;
     }
-    while (1) {
-        temp = writev(sock_fd, iv, iv_count);
-        LOG_INFO("send sth to client");
-        // std::cout << "sock_fd: " << sock_fd << std::endl;
-        if (temp < 0) {
-            // TCP 写缓存满，监听下一个写事件
-            if (errno == EAGAIN) {
-                // std::cout << "TCP write buffer is full, waiting for next EPOLLOUT event" << std::endl;
-                EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLOUT);
 
-                LOG_INFO_T("write buf is full.");
-                return true;
-            }
-            unmap();
-            return false;
+    int temp = writev(sock_fd, iv, iv_count);
+    if (temp < 0) {
+        if (errno == EAGAIN) {
+            LOG_INFO_T("write buf is full, fd: %d", sock_fd);
+            return WRITE_RES::WRITE_AGAIN;
         }
-        // std::cout << "Sent " << temp << " bytes for " << real_file << ", remaining " << bytes_to_send - temp << std::endl;
-        bytes_have_send += temp;
-        bytes_to_send -= temp;
-        if (bytes_have_send >= iv[0].iov_len) {
-            iv[0].iov_len = 0;
-            iv[1].iov_base = file_address + (bytes_have_send - write_idx);
-            iv[1].iov_len = bytes_to_send;
+        unmap();
+        LOG_ERROR("writev failed for fd: %d, errno: %d", sock_fd, errno);
+        return WRITE_RES::WRITE_FAILED;
+    }
+
+    LOG_INFO("sent %d bytes to client fd: %d", temp, sock_fd);
+    bytes_have_send += temp;
+    bytes_to_send -= temp;
+
+    if (bytes_have_send >= iv[0].iov_len) {
+        iv[0].iov_len = 0;
+        iv[1].iov_base = file_address + (bytes_have_send - write_idx);
+        iv[1].iov_len = bytes_to_send;
+    } else {
+        iv[0].iov_base = write_buffer + bytes_have_send;
+        iv[0].iov_len = iv[0].iov_len - bytes_have_send;
+    }
+
+    if (bytes_to_send <= 0) {
+        unmap();
+        if (linger) {
+            init();
+            LOG_INFO("keep-alive is true, fd: %d", sock_fd);
+            return WRITE_RES::WRITE_LINGER;
         } else {
-            iv[0].iov_base = write_buffer + bytes_have_send;
-            iv[0].iov_len = iv[0].iov_len - bytes_have_send;
-        }
-        if (bytes_to_send <= 0) {
-            unmap();
-            EpollUtil::getInstance()->modFd(epoll_fd, sock_fd, EPOLLIN);
-            if (linger) {
-                init();
-                LOG_INFO("keep-alive is true");
-                return true;
-            } else {
-                LOG_INFO("keep-alive is false, return false");
-                return false;
-            }
+            LOG_INFO("keep-alive is false, fd: %d", sock_fd);
+            return WRITE_RES::WRITE_CLOSED;
         }
     }
+    return WRITE_RES::WRITE_AGAIN;
 }
 
 void HttpConn::unmap() {
@@ -347,7 +319,7 @@ bool HttpConn::addBlankLine() {
 bool HttpConn::addContentType() {
     const char* type = nullptr;
     if (strstr(real_file, ".html"))
-        type = "text/html";
+        type = "text/html; charset=utf-8"; // 增加utf-8声明
     else if (strstr(real_file, ".jpg"))
         type = "image/jpeg";
     else if (strstr(real_file, ".png"))
@@ -499,8 +471,6 @@ HTTP_CODE HttpConn::parseRequestBody(char* text) {
 HTTP_CODE HttpConn::doRequest() {
     strcpy(real_file, html_root);
     int len = strlen(html_root);
-    // printf("url:%s\n", url);
-    // std::cout << "url: " << url << std::endl;
     const char* p = strrchr(url, '/');
     if (cgi == 1){
         // TODO 处理数据库等信息
@@ -510,6 +480,8 @@ HTTP_CODE HttpConn::doRequest() {
         strcpy(url_real, "/register.html");
         strncpy(real_file + len, url_real, strlen(url_real));
         free(url_real);
+        // FOR TEST
+        LOG_INFO("construct realfile:%s", real_file);
     } else if(*(p + 1) == '1') {
         char* url_real = (char*)malloc(sizeof(char) * 200);
         strcpy(url_real, "/log.html");
@@ -547,7 +519,8 @@ HTTP_CODE HttpConn::doRequest() {
         return HTTP_CODE::BAD_REQUEST; // 请求的是目录
     }
     int file_fd = open(real_file, O_RDONLY);
+    SafeFdManager::getInstance().registerFd(file_fd, "doRequest");
     file_address = (char*)mmap(0, file_stat.st_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
-    close(file_fd);
+    SafeFdManager::getInstance().safeClose(file_fd);
     return HTTP_CODE::FILE_REQUEST;
 }  

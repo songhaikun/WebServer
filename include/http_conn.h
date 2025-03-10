@@ -111,15 +111,22 @@ public:
     static int epoll_fd;
     static int user_count;
 public:
+    enum class WRITE_RES {
+        WRITE_END = 0,
+        WRITE_AGAIN,
+        WRITE_FAILED,
+        WRITE_LINGER,
+        WRITE_CLOSED
+    };
     HttpConn();
     explicit HttpConn(int client_fd);
     void process();
 
     // 提供外部epoll调用
     void init(int sockfd, const sockaddr_in &addr);
-    void closeConn(bool real_close = true);
-    bool readOnce();
-    bool write();
+    // bool readOnce();
+    bool read();
+    WRITE_RES write();
 
     sockaddr_in *get_address()
     {

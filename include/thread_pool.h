@@ -1,13 +1,15 @@
 #pragma once
 #include <thread>
-#include <list>
+#include <deque>
 #include <mutex>
-#include <semaphore.h>
+#include <condition_variable>
 #include <vector>
-#include <iostream>
 #include <functional>
 #include <memory>
+#include <iostream>
 
+
+#include "log.h"
 struct ThreadPoolTask {
     std::function<void(std::shared_ptr<void>)> fun;
     std::shared_ptr<void> args;
@@ -17,70 +19,77 @@ class ThreadPool {
 private:
     int threadNum;
     std::vector<std::thread> threads;
-    std::list<ThreadPoolTask> tasks;  // 任务队列存储 ThreadPoolTask
-    std::mutex pool_mutex;
-    sem_t task_sem;
+    std::deque<ThreadPoolTask> tasks; // 使用 deque
+    mutable std::mutex pool_mutex;
+    std::condition_variable cond;
     int max_request;
     bool stop{false};
+    int idle_threads{0}; // 空闲线程计数，用于优化唤醒
 
 public:
-    explicit ThreadPool(int threadNum = 8);
-    ~ThreadPool();
-    void append(std::function<void(std::shared_ptr<void>)> fun, std::shared_ptr<void> args);
-};
+    explicit ThreadPool(int threadNum = std::thread::hardware_concurrency() * 2, int max_request = 65535)
+        : threadNum(threadNum), max_request(max_request), idle_threads(threadNum) {
+        if (max_request <= 0) {
+            throw std::invalid_argument("max_request must be positive");
+        }
+        for (int i = 0; i < threadNum; ++i) {
+            threads.emplace_back([this] {
+                while (true) {
+                    ThreadPoolTask task;
+                    {
+                        std::unique_lock<std::mutex> lock(pool_mutex);
+                        // 等待条件：停止或有任务且当前线程可以处理
+                        cond.wait(lock, [this] { 
+                            return stop || (!tasks.empty() && idle_threads > 0); 
+                        });
+                        if (stop && tasks.empty()) return;
 
-ThreadPool::ThreadPool(int threadNum) : threadNum(threadNum), max_request(10000) {
-    if (sem_init(&task_sem, 0, 0) != 0) {
-        throw std::runtime_error("sem_init failed");
-    }
-
-    for (int i = 0; i < threadNum; ++i) {
-        auto thr = std::thread([this]() {
-            while (!stop) {
-                sem_wait(&task_sem);
-                ThreadPoolTask task;
-                {
-                    std::unique_lock<std::mutex> lock(this->pool_mutex);
-                    if (tasks.empty()) {
-                        continue; // 理论上不应发生，除非 stop 设置后队列清空
+                        // 减少空闲线程计数，确保只有一个线程处理
+                        --idle_threads;
+                        task = std::move(tasks.front());
+                        tasks.pop_front();
                     }
-                    task = tasks.front();
-                    tasks.pop_front();
+                    // 执行任务
+                    task.fun(task.args);
+                    {
+                        std::lock_guard<std::mutex> lock(pool_mutex);
+                        ++idle_threads; // 任务完成，恢复空闲状态
+                    }
                 }
-                if (task.fun) {
-                    task.fun(task.args);  // 执行任务函数
-                }
-            }
-        });
-        thr.detach();
-        threads.emplace_back(std::move(thr));
+            });
+        }
     }
-}
 
-ThreadPool::~ThreadPool() {
-    {
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            stop = true;
+        }
+        cond.notify_all(); // 唤醒所有线程以退出
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    }
+
+    bool append(std::function<void(std::shared_ptr<void>)> fun, std::shared_ptr<void> args) {
         std::lock_guard<std::mutex> lock(pool_mutex);
-        stop = true;
-    }
-    for (int i = 0; i < threadNum; ++i) {
-        sem_post(&task_sem);
-    }
-    for (auto& thr : threads) {
-        if (thr.joinable()) {
-            thr.join();
+        if (stop) return false;
+        if (tasks.size() >= max_request) {
+            LOG_WARN("ThreadPool task queue full, dropping task. Current size: %zu", tasks.size());
+            return false;
         }
+        tasks.push_back({std::move(fun), args});
+        cond.notify_all(); // 唤醒所有线程，但只有符合条件的执行
+        return true;
     }
-    sem_destroy(&task_sem);
-}
 
-void ThreadPool::append(std::function<void(std::shared_ptr<void>)> fun, std::shared_ptr<void> args) {
-    std::unique_lock<std::mutex> lock(pool_mutex, std::defer_lock_t());
-    if (lock.try_lock()) {
-        if (tasks.size() < max_request) {
-            tasks.push_back({fun, args});  // 构造 ThreadPoolTask 并存入队列
-            sem_post(&task_sem);
-        }
-        lock.unlock();
+    size_t queueSize() const {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        return tasks.size();
     }
-    // 如果加锁失败或队列满，丢弃任务
-}
+
+    int idleThreads() const {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        return idle_threads;
+    }
+};

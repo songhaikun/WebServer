@@ -78,5 +78,6 @@ private:
 
 // TODO only for test, delete this
 // #define LOG_INFO(format, ...) ;
+// #define LOG_WARN(format, ...) ;
 // #define LOG_ERROR(format, ...) ;
 // #define LOG_INFO_T(format, ...) ;

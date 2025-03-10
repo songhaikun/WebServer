@@ -5,20 +5,20 @@
 #include <unordered_map>
 #include <mutex>  // 添加 mutex 头文件
 
-struct timer_node {
+struct TimerNode {
     int fd;                            // 文件描述符
     time_t expire;                     // 超时时间
     std::function<void(int)> callback; // 回调函数
-    timer_node* prev;                  // 前驱指针
-    timer_node* next;                  // 后继指针
+    TimerNode* prev;                  // 前驱指针
+    TimerNode* next;                  // 后继指针
 };
 
-class sort_timer_lst : public TimerBase {
+class SortTimerList : public TimerBase {
 public:
-    sort_timer_lst(time_t unit = 5) : head(nullptr), tail(nullptr), timeout_unit(unit) {}
-    ~sort_timer_lst() {
-        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁保护析构
-        timer_node* tmp = head;
+    SortTimerList(time_t unit = 5) : head(nullptr), tail(nullptr), timeout_unit(unit) {}
+    ~SortTimerList() {
+        std::lock_guard<std::mutex> lock(mutex_);  // 加锁保护析构
+        TimerNode* tmp = head;
         while (tmp) {
             head = tmp->next;
             delete tmp;
@@ -27,8 +27,8 @@ public:
     }
 
     void add_timer(int fd, time_t timeout_sec, std::function<void(int)> callback) override {
-        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
-        timer_node* timer = new timer_node{fd, time(nullptr) + timeout_sec * timeout_unit, callback, nullptr, nullptr};
+        std::lock_guard<std::mutex> lock(mutex_);  // 加锁
+        TimerNode* timer = new TimerNode{fd, time(nullptr) + timeout_sec * timeout_unit, callback, nullptr, nullptr};
         nodes[fd] = timer; // 记录 fd 到 timer 的映射
         if (!head) {
             head = tail = timer;
@@ -42,10 +42,10 @@ public:
     }
 
     void adjust_timer(int fd, time_t timeout_sec) override {
-        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
+        std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         auto it = nodes.find(fd);
         if (it == nodes.end()) return;
-        timer_node* timer = it->second;
+        TimerNode* timer = it->second;
         timer->expire = time(nullptr) + timeout_sec * timeout_unit;
         if (timer == head) {
             if (!timer->next || timer->expire <= timer->next->expire) return;
@@ -61,10 +61,10 @@ public:
     }
 
     void del_timer(int fd) override {
-        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
+        std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         auto it = nodes.find(fd);
         if (it == nodes.end()) return;
-        timer_node* timer = it->second;
+        TimerNode* timer = it->second;
         timer->callback(fd); // 调用回调关闭连接
         nodes.erase(it);
         if (timer == head && timer == tail) {
@@ -86,11 +86,11 @@ public:
     }
 
     void tick() override {
-        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
+        std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         if (!head) return;
         time_t cur = time(nullptr);
         while (head && head->expire <= cur) {
-            timer_node* tmp = head;
+            TimerNode* tmp = head;
             tmp->callback(tmp->fd);
             nodes.erase(tmp->fd);
             head = tmp->next;
@@ -100,14 +100,14 @@ public:
     }
 
     void set_timeout_unit(time_t unit) override {
-        // std::lock_guard<std::mutex> lock(mutex_);  // 加锁
+        std::lock_guard<std::mutex> lock(mutex_);  // 加锁
         timeout_unit = unit;
     }
 
 private:
-    void add_timer_internal(timer_node* timer, timer_node* lst_head) {
-        timer_node* prev = lst_head;
-        timer_node* tmp = prev->next;
+    void add_timer_internal(TimerNode* timer, TimerNode* lst_head) {
+        TimerNode* prev = lst_head;
+        TimerNode* tmp = prev->next;
         while (tmp) {
             if (timer->expire < tmp->expire) {
                 prev->next = timer;
@@ -128,11 +128,11 @@ private:
     }
 
 private:
-    timer_node* head;
-    timer_node* tail;
-    std::unordered_map<int, timer_node*> nodes; // fd 到 timer 的映射
+    TimerNode* head;
+    TimerNode* tail;
+    std::unordered_map<int, TimerNode*> nodes; // fd 到 timer 的映射
     time_t timeout_unit;                        // 超时单位
-    // std::mutex mutex_;                          // 互斥锁，用于线程安全
+    std::mutex mutex_;                          // 互斥锁，用于线程安全
 };
 
 #endif

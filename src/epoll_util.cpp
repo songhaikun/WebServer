@@ -1,4 +1,5 @@
 #include "epoll_util.h"
+#include "fd_manager.hpp"
 
 EpollUtil* EpollUtil::getInstance() {
     static EpollUtil instance;
@@ -23,7 +24,7 @@ void EpollUtil::addFd(int epollfd, int fd, bool one_shot) {
 
 void EpollUtil::removeFd(int epollfd, int fd) {
     epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, 0);
-    close(fd);
+    // SafeFdManager::getInstance().safeClose(fd);  // 使用安全关闭
 }
 
 void EpollUtil::modFd(int epollfd, int fd, int ev) {

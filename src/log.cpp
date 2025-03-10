@@ -2,6 +2,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include <thread>
+#include <sstream>
 #include "log.h"
 
 Log::Log()
@@ -111,7 +113,6 @@ void Log::write_log(int level, const char *format, ...)
 
     va_list valst;
     va_start(valst, format);
-
     int n = snprintf(m_buf, 48, "%d-%02d-%02d %02d:%02d:%02d.%06ld %s ",
                      my_tm.tm_year + 1900, my_tm.tm_mon + 1, my_tm.tm_mday,
                      my_tm.tm_hour, my_tm.tm_min, my_tm.tm_sec, now.tv_usec, s);
