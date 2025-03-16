@@ -43,7 +43,6 @@ void EventLoop::loop() {
     const int MAX_EVENTS = 10000;
     std::vector<epoll_event> events(MAX_EVENTS);
     quit_ = false;
-
     while (!quit_) {
         int num_events = epoll_wait(epoll_fd_, events.data(), MAX_EVENTS, -1);
         if (num_events < 0) {
@@ -51,16 +50,18 @@ void EventLoop::loop() {
             std::cout << "epoll_wait return failed!" << std::endl;
             break;
         }
-
         handleEvents(events, num_events);
+        doPendingFunctors(); // 处理任务队列
     }
 }
 
 void EventLoop::quit() {
     quit_ = true;
     // 写入管道以唤醒 epoll_wait
-    char buf = 'q';
-    write(pipe_fd_[1], &buf, 1);
+    if (!isInLoopThread()) {
+        char buf = 'q';
+        write(pipe_fd_[1], &buf, 1);
+    }
 }
 
 void EventLoop::addEvent(int fd, uint32_t events, EventCallback cb) {
@@ -98,11 +99,12 @@ void EventLoop::handleSignal() {
     ssize_t n = read(pipe_fd_[0], buf, sizeof(buf));
     if (n <= 0) return;
 
-    // 简单处理：假设管道用于 quit 信号
-    // 如果需要处理其他信号，可以解析 buf 中的内容
     for (ssize_t i = 0; i < n; ++i) {
         if (buf[i] == 'q') {
             quit_ = true;
+        } else if (buf[i] == 't') {
+            // 任务通知，处理任务队列
+            doPendingFunctors();
         }
     }
 }
@@ -138,4 +140,42 @@ int EventLoop::setNonblocking(int fd) {
         return -1;
     }
     return 0;
+}
+
+void EventLoop::runInLoop(Functor cb) {
+    if (isInLoopThread()) {
+        // 如果已在所属线程，直接执行
+        cb();
+    } else {
+        // 否则加入任务队列并唤醒
+        {
+            std::lock_guard<std::mutex> lock(functorMutex_);
+            pendingFunctors_.push(std::move(cb));
+        }
+        // 写入管道以唤醒 epoll_wait
+        char buf = 't'; // 't' 表示任务通知
+        write(pipe_fd_[1], &buf, 1);
+    }
+}
+
+void EventLoop::doPendingFunctors() {
+    std::queue<Functor> functors;
+    {
+        std::lock_guard<std::mutex> lock(functorMutex_);
+        std::swap(functors, pendingFunctors_); // 交换队列以减少锁持有时间
+    }
+
+    while (!functors.empty()) {
+        Functor cb = std::move(functors.front());
+        functors.pop();
+        cb();
+    }
+}
+
+int EventLoop::getEpollFd() const {
+    return epoll_fd_;
+}
+
+bool EventLoop::isInLoopThread() const {
+    return threadId_ == std::this_thread::get_id(); 
 }

@@ -196,9 +196,10 @@ bool HttpConn::read() {
     return true;
 }
 
-void HttpConn::init(int sockfd, const sockaddr_in &addr) {
+void HttpConn::init(int sockfd, const sockaddr_in &addr, EventLoop* loop) {
     sock_fd = sockfd;
     address = addr;
+    loop_ = loop;
     EpollUtil::getInstance()->addFd(epoll_fd, sock_fd, true);
     user_count++;
     init();

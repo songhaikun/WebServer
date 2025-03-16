@@ -1,4 +1,20 @@
 #include "server.h"
+
+#include <cstring>
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/types.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <ctime>
+#include <fstream>
+#include <cassert>
+#include <errno.h>
+#include <sys/epoll.h>
+#include <sstream>
+#include <memory>
+
 #include "fd_manager.hpp"
 
 std::unordered_map<int, std::function<void(int)>> signal_handlers;
@@ -7,6 +23,7 @@ Server::Server(EventLoop* loop, int port, int thread_num)
     : loop_(loop), port_(port), thread_num_(thread_num), listen_fd_(-1) {
     users_ = new HttpConn[MAX_FD];
     assert(users_ != nullptr);
+    thread_pool_ = std::make_unique<EventLoopThreadPool>(loop, thread_num);
 }
 
 Server::~Server() {
@@ -20,6 +37,7 @@ void Server::start() {
     initSocket();
     initSignal();
     setupEvents();
+    thread_pool_->start();
     loop_->loop();
 }
 
@@ -31,19 +49,16 @@ void Server::initSocket() {
     }
     SafeFdManager::getInstance().registerFd(listen_fd_, "listen_fd");
     EpollUtil::getInstance()->setNonblocking(listen_fd_);
-    
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port_);
     addr.sin_addr.s_addr = INADDR_ANY;
     int opt = 1;
     setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
     if (bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind error!");
         exit(-1);
     }
-
     if (listen(listen_fd_, 10000) < 0) {
         perror("listen error!");
         exit(-1);
@@ -56,7 +71,6 @@ void Server::initSignal() {
     sa.sa_handler = SIG_IGN;
     sigfillset(&sa.sa_mask);
     assert(sigaction(SIGPIPE, &sa, NULL) != -1);
-
     if (socketpair(PF_UNIX, SOCK_STREAM, 0, pipefd_) < 0) {
         perror("socketpair");
         exit(-1);
@@ -64,19 +78,15 @@ void Server::initSignal() {
     SafeFdManager::getInstance().registerFd(pipefd_[0], "pipefd[0]");
     SafeFdManager::getInstance().registerFd(pipefd_[1], "pipefd[1]");
     EpollUtil::getInstance()->setNonblocking(pipefd_[1]);
-
     loop_->addEvent(pipefd_[0], EPOLLIN, [this](uint32_t events) { handleSignal(); });
-
     addsig(SIGALRM, [this](int) {
         int msg = SIGALRM;
         send(pipefd_[1], (char*)&msg, 1, 0);
     }, false);
-
     addsig(SIGTERM, [this](int) {
         int msg = SIGTERM;
         send(pipefd_[1], (char*)&msg, 1, 0);
     }, false);
-
     alarm(TIMESLOT);
 }
 
@@ -114,59 +124,61 @@ void Server::handleAccept() {
 
         SafeFdManager::getInstance().registerFd(client_fd, "client_conn");
         EpollUtil::getInstance()->setNonblocking(client_fd);
-        users_[client_fd].init(client_fd, client_addr);
-        timer_lst_.add_timer(client_fd, 3, [this](int fd) { cb_func(fd); });
 
-        loop_->addEvent(client_fd, EPOLLIN | EPOLLRDHUP | EPOLLERR, 
-            [this, client_fd](uint32_t events) {
-                if (events & (EPOLLRDHUP | EPOLLERR)) {
-                    LOG_INFO("rdhup or err, delete timer, fd: %d", client_fd);
-                    timer_lst_.del_timer(client_fd);
-                } else {
-                    handleClientEvent(client_fd);
-                }
-            });
+        EventLoop* ioLoop = thread_pool_->getNextLoop();
+        ioLoop->runInLoop([this, client_fd, client_addr, ioLoop]() {
+            // 在工作线程的 EventLoop 中注册事件
+            users_[client_fd].init(client_fd, client_addr, ioLoop);
+            timer_lst_.add_timer(client_fd, 3, [this](int fd) { cb_func(fd); });
+            ioLoop->addEvent(client_fd, EPOLLIN | EPOLLRDHUP | EPOLLERR, 
+                [this, client_fd](uint32_t events) {
+                    if (events & (EPOLLRDHUP | EPOLLERR)) {
+                        LOG_INFO("rdhup or err, delete timer, fd: %d", client_fd);
+                        timer_lst_.del_timer(client_fd);
+                    } else {
+                        handleClientEvent(client_fd);
+                    }
+                });
+        });
     }
 }
 
 void Server::handleClientEvent(int client_fd) {
-    auto context = std::make_shared<EventContext>();
-    context->sock_fd = client_fd;
-    context->conn = &users_[client_fd];
-    context->pool = &pool_;
-
-    pool_.append([this](std::shared_ptr<void> args) -> bool {
-        auto ctx = std::static_pointer_cast<EventContext>(args);
-        auto conn = ctx->conn;
-        int sock_fd = ctx->sock_fd;
-
-        if (conn->read()) {
-            conn->process();
-            switch (conn->write()) {
-                case HttpConn::WRITE_RES::WRITE_END:
-                case HttpConn::WRITE_RES::WRITE_LINGER:
-                    loop_->modifyEvent(sock_fd, EPOLLIN | EPOLLRDHUP | EPOLLERR);
-                    timer_lst_.adjust_timer(sock_fd, 3);
-                    break;
-                case HttpConn::WRITE_RES::WRITE_AGAIN:
-                    loop_->modifyEvent(sock_fd, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR);
-                    break;
-                case HttpConn::WRITE_RES::WRITE_CLOSED:
-                case HttpConn::WRITE_RES::WRITE_FAILED:
-                    LOG_INFO("write closed/failed, delete timer, fd: %d", sock_fd);
-                    loop_->removeEvent(sock_fd);
-                    timer_lst_.del_timer(sock_fd);
-                    break;
-                default:
-                    break;
-            }
-        } else {
-            LOG_INFO("read failed, delete timer, fd: %d", sock_fd);
-            loop_->removeEvent(sock_fd);
-            timer_lst_.del_timer(sock_fd);
+    HttpConn* conn = &users_[client_fd];
+    if (conn->read()) {
+        conn->process();
+        switch (conn->write()) {
+            case HttpConn::WRITE_RES::WRITE_END:
+            case HttpConn::WRITE_RES::WRITE_LINGER:
+                // 在连接所属的 EventLoop 中修改事件
+                conn->getLoop()->runInLoop([conn]() {
+                    conn->getLoop()->modifyEvent(conn->getFd(), EPOLLIN | EPOLLRDHUP | EPOLLERR);
+                });
+                timer_lst_.adjust_timer(client_fd, 3);
+                break;
+            case HttpConn::WRITE_RES::WRITE_AGAIN:
+                conn->getLoop()->runInLoop([conn]() {
+                    conn->getLoop()->modifyEvent(conn->getFd(), EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR);
+                });
+                break;
+            case HttpConn::WRITE_RES::WRITE_CLOSED:
+            case HttpConn::WRITE_RES::WRITE_FAILED:
+                LOG_INFO("write closed/failed, delete timer, fd: %d", client_fd);
+                conn->getLoop()->runInLoop([conn]() {
+                    conn->getLoop()->removeEvent(conn->getFd());
+                });
+                timer_lst_.del_timer(client_fd);
+                break;
+            default:
+                break;
         }
-        return true;
-    }, context);
+    } else {
+        LOG_INFO("read failed, delete timer, fd: %d", client_fd);
+        conn->getLoop()->runInLoop([conn]() {
+            conn->getLoop()->removeEvent(conn->getFd());
+        });
+        timer_lst_.del_timer(client_fd);
+    }
 }
 
 void Server::handleSignal() {

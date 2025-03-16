@@ -1,3 +1,4 @@
+#include "event_loop.h"
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -22,12 +23,33 @@ enum class HTTP_CODE {
 };
 
 class HttpConn{
+public:
+    static int epoll_fd;
+    static int user_count;
+public:
+    enum class WRITE_RES {
+        WRITE_END = 0,
+        WRITE_AGAIN,
+        WRITE_FAILED,
+        WRITE_LINGER,
+        WRITE_CLOSED
+    };
+    HttpConn();
+    explicit HttpConn(int client_fd);
+    void process();
+    // 提供外部epoll调用
+    void init(int sockfd, const sockaddr_in &addr, EventLoop* loop);
+    EventLoop* getLoop() const { return loop_; }
+    int getFd() const { return sock_fd; }
+    // bool readOnce();
+    bool read();
+    WRITE_RES write();
+    sockaddr_in *get_address() { return &address; }
+
 private:
     int client_fd{-1};
     int sock_fd{-1};
     sockaddr_in address;
-
-    // 静态变量，用于存储全局信息
 
     char read_buffer[MAX_HEADER_LENGTH];
     char write_buffer[WRITE_BUFFER_SIZE];
@@ -78,6 +100,7 @@ private:
         PATH
     };
     HTTP_METHOD method;
+    EventLoop* loop_;
     
 
 private:
@@ -107,29 +130,4 @@ private:
 
     char *getLine() { return read_buffer + start_line; };
 
-public:
-    static int epoll_fd;
-    static int user_count;
-public:
-    enum class WRITE_RES {
-        WRITE_END = 0,
-        WRITE_AGAIN,
-        WRITE_FAILED,
-        WRITE_LINGER,
-        WRITE_CLOSED
-    };
-    HttpConn();
-    explicit HttpConn(int client_fd);
-    void process();
-
-    // 提供外部epoll调用
-    void init(int sockfd, const sockaddr_in &addr);
-    // bool readOnce();
-    bool read();
-    WRITE_RES write();
-
-    sockaddr_in *get_address()
-    {
-        return &address;
-    }
 };
